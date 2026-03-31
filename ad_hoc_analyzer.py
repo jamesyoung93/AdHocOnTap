@@ -110,9 +110,14 @@ _TIME = (DateType, TimestampType)
 # COMMAND ----------
 
 from openai import OpenAI
-from databricks.sdk import WorkspaceClient
 
-LLM_CLIENT = WorkspaceClient().serving_endpoints.get_open_ai_client()
+_token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+_host  = spark.conf.get("spark.databricks.workspaceUrl")
+
+LLM_CLIENT = OpenAI(
+    api_key=_token,
+    base_url=f"https://{_host}/serving-endpoints",
+)
 
 def call_llm(system_prompt: str, user_prompt: str, max_tokens=None) -> str:
     with warnings.catch_warnings():
