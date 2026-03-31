@@ -138,16 +138,23 @@ def strip_fences(text):
 
 def parse_json(response, fallback=None):
     cleaned = strip_fences(response)
+    result = None
     try:
-        return json.loads(cleaned)
+        result = json.loads(cleaned)
     except json.JSONDecodeError:
         for pat in [r'\{.*\}', r'\[.*\]']:
             m = re.search(pat, cleaned, re.DOTALL)
             if m:
-                try: return json.loads(m.group())
+                try: result = json.loads(m.group()); break
                 except json.JSONDecodeError: continue
+    if result is None:
         if fallback is not None: return fallback
-        raise
+        raise json.JSONDecodeError("No JSON found", cleaned, 0)
+    # if caller expects a dict but LLM returned a list, wrap it
+    if isinstance(fallback, dict) and isinstance(result, list):
+        first_key = next(iter(fallback), "data")
+        result = {first_key: result}
+    return result
 
 
 # COMMAND ----------
