@@ -35,7 +35,11 @@ This links the GitHub repo directly into your workspace. Changes you pull are re
    https://github.com/jamesyoung93/AdHocOnTap.git
    ```
 5. Branch: `main` → Click **Create Git folder**
-6. The `.py` files will appear as notebooks — open them directly
+6. Expand the **AdHocOnTap** folder that appears in your workspace
+7. **Click on `ad_hoc_analyzer.py`** (or `iterative_html_builder_v4.py`) — **this opens it as a notebook**. The `# COMMAND ----------` markers automatically split it into cells. You do NOT need to create a separate notebook — the `.py` file IS the notebook.
+8. Attach a running cluster, edit Cell 1, and click **Run All**
+
+> **Common mistake:** Don't create a fresh empty notebook and try to import the code — just open the `.py` file directly from the repo folder. It's already a notebook.
 
 ### Option B: Import as notebooks
 
@@ -43,13 +47,14 @@ This links the GitHub repo directly into your workspace. Changes you pull are re
 2. In Databricks, click **Workspace** → navigate to your target folder
 3. Click **⋮** → **Import**
 4. Select the `.py` file → Databricks auto-detects the `# COMMAND ----------` markers and converts it to a multi-cell notebook
+5. Open the imported notebook, edit Cell 1, Run All
 
 ### Option C: Copy-paste
 
 1. Create a new **Python notebook** in Databricks
 2. Copy the entire contents of the `.py` file
 3. Paste into the first cell
-4. Databricks will split it into cells at each `# COMMAND ----------` marker when you re-open the notebook
+4. **Close and re-open the notebook** — Databricks splits it into cells at each `# COMMAND ----------` marker on re-open
 
 ---
 
@@ -57,14 +62,17 @@ This links the GitHub repo directly into your workspace. Changes you pull are re
 
 ### 1. Install dependencies (first run only)
 
-Uncomment the first two lines in Cell 1 and run that cell alone:
+Uncomment the first two lines in Cell 1 and **run Cell 1 alone** (not Run All yet):
 
 ```python
 %pip install PyPDF2
 dbutils.library.restartPython()
 ```
 
-After the Python restart, **re-run Cell 1** (with those lines commented out again) and continue.
+This installs the library and restarts the Python process. After the restart:
+- Comment those two lines back out (or leave them — they just re-install each time)
+- **You are still in the same notebook** — the `.py` file you opened. Don't switch to a different notebook.
+- Now edit the rest of Cell 1 (tables, PDFs, prompt) and **Run All** from Cell 1 down.
 
 ### 2. Configure Cell 1
 
