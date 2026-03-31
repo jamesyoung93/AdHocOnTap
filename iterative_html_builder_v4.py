@@ -1,4 +1,4 @@
-# Databricks Notebook Source
+# Databricks notebook source
 # ============================================================
 #  Iterative HTML Builder v4 — Databricks Agent Framework
 # ============================================================
