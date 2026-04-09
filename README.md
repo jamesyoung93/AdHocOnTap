@@ -218,7 +218,11 @@ The smart profiler goes beyond basic stats. Here's what it finds:
 
 The analyzer caches each table's profile **and** its LLM-inferred column meanings to disk so repeat runs don't redo expensive work. The cache lives at `/dbfs/FileStore/ad_hoc_analyzer_cache/` and is keyed by `sha256(table_address + schema.json())` — if the table's schema changes, the cache auto-invalidates.
 
-On a cached run you'll see `⚡ table_name (cached: …)` instead of the usual profiling output, and Phase 3 (column inference) is skipped entirely for those tables.
+The cache is **column-level incremental**:
+- A repeat run with the same `MAX_PROFILE_COLS` is a near-instant full hit (you'll see `(cached: all N cols)` and Phase 3 is skipped entirely).
+- If you bump `MAX_PROFILE_COLS` from 10 to 20 between runs, only the **10 new columns** are profiled and only those columns get sent to the LLM for meaning inference. The original 10 are reused as-is.
+- Type changes on a column auto-invalidate just that column.
+- The structural-detection layer (entities / time grain / completeness / time-series stats) is also reused when nothing changed and the entity / time-column selection is unchanged; otherwise it's recomputed against the merged column set.
 
 **Settings (Cell 1):**
 ```python

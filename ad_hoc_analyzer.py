@@ -229,8 +229,14 @@ def _context_cache_key(source, schema):
 def _cache_path(cache_dir, key):
     return os.path.join(cache_dir, f"{key}.json")
 
+CACHE_SCHEMA_VERSION = 2
+
 def load_context(cache_dir, source, schema):
-    """Return cached {profile, col_map_entries} dict, or None."""
+    """Return cached {profile, col_map_entries} dict, or None.
+
+    Returns None for cache files written by an older schema version
+    so the analyzer transparently rebuilds them.
+    """
     if not cache_dir:
         return None
     key = _context_cache_key(source, schema)
@@ -239,28 +245,36 @@ def load_context(cache_dir, source, schema):
         return None
     try:
         with open(path, "r") as f:
-            return json.load(f)
+            payload = json.load(f)
     except Exception as e:
         print(f"    ⚠️  cache read failed ({e}) — will rebuild")
         return None
+    if payload.get("version") != CACHE_SCHEMA_VERSION:
+        return None  # stale schema; treat as miss
+    return payload
 
 def save_context(cache_dir, source, schema, profile, col_map_entries):
-    """Write a cache entry for one table."""
+    """Write a cache entry for one table (atomic via temp+rename)."""
     if not cache_dir:
         return
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        key = _context_cache_key(source, schema)
+        key  = _context_cache_key(source, schema)
+        path = _cache_path(cache_dir, key)
         payload = {
-            "version": 1,
+            "version": CACHE_SCHEMA_VERSION,
             "cached_at": datetime.utcnow().isoformat(),
             "source": str(source),
             "schema_hash": key,
             "profile": profile,
             "col_map_entries": col_map_entries,
         }
-        with open(_cache_path(cache_dir, key), "w") as f:
+        # write to a sibling temp file then rename — protects against
+        # partially written cache files if two runs collide.
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(payload, f, default=str)
+        os.replace(tmp, path)
     except Exception as e:
         print(f"    ⚠️  cache write failed: {e}")
 
@@ -541,40 +555,21 @@ def time_summary_stats(spark_session, df, time_col, metric_cols, entity_col=None
 
 # ── Main profiler ──
 
-def profile_table(spark_session, source, label):
-    """Full smart profile: schema, stats, entity/time/grain/completeness.
+def _compute_column_stats(df_full, df_sample, fields, row_count):
+    """Profile a SUBSET of columns. Returns {col_name: info_dict}.
 
-    Speed notes:
-      • Batch stats run in ONE pass over the full table.  We use
-        approx_count_distinct (HLL) instead of exact countDistinct
-        — same single pass, much cheaper on wide tables.
-      • Percentiles and top-values run against a CACHED SAMPLE of
-        the table (configurable via SAMPLE_FOR_STATS).  Sample is
-        unpersisted before we return.
-      • All approxQuantile calls are batched into ONE Spark job.
-      • Per-column top-value queries run concurrently from the
-        driver via a thread pool — N queries become roughly N/k.
+    Heavy lifting for the per-column statistics:
+      • Single-pass batch stats over the full table (HLL distinct).
+      • Batched approxQuantile for all numeric columns at once.
+      • Parallel top-value queries from the driver thread pool.
+
+    df_full   : full table (used for the single-pass batch stats)
+    df_sample : cached sample DataFrame (used for percentiles + top values)
     """
-    if isinstance(source, str):
-        df = spark_session.table(source); src = source
-    else:
-        df = source; src = "DataFrame"
-    df.createOrReplaceTempView(label)
+    if not fields:
+        return {}
 
-    fields = df.schema.fields
-    if len(fields) > MAX_PROFILE_COLS:
-        print(f"    ⚠️  {len(fields)} cols — profiling first {MAX_PROFILE_COLS}")
-        fields = fields[:MAX_PROFILE_COLS]
-        df = df.select(*[f.name for f in fields])
-
-    row_count = df.count()
-    if row_count == 0:
-        return {"label": label, "source": src, "row_count": 0,
-                "col_count": len(fields), "columns": [], "sample_rows": [],
-                "entities": [], "time_cols": [], "groupings": [],
-                "completeness": None, "grain": None, "time_stats": None}
-
-    # ── batch stats: ONE pass over full table (approx distincts) ──
+    # ── batch stats in ONE pass over df_full ──
     exprs = []
     for i, f in enumerate(fields):
         cn = f.name
@@ -592,10 +587,9 @@ def profile_table(spark_session, source, label):
             exprs += [F.min(F.length(cn)).alias(f"_{i}_lmi"),
                       F.max(F.length(cn)).alias(f"_{i}_lmx"),
                       F.mean(F.length(cn)).alias(f"_{i}_lmu")]
+    batch = df_full.select(*exprs).collect()[0]
 
-    batch = df.select(*exprs).collect()[0]
-
-    columns = []
+    result = {}
     numeric_names = []
     string_names  = []
     for i, f in enumerate(fields):
@@ -620,77 +614,179 @@ def profile_table(spark_session, source, label):
             info["category"] = "boolean"
         else:
             info["category"] = "complex"
-        columns.append(info)
+        result[f.name] = info
 
-    # ── cache a working sample for the per-column heavy work ──
-    if row_count > SAMPLE_FOR_STATS:
-        frac = min(1.0, SAMPLE_FOR_STATS / row_count)
-        df_stats = df.sample(fraction=frac, seed=42).cache()
-        sample_size = df_stats.count()
-        print(f"    (sampled {sample_size:,}/{row_count:,} rows for stats)")
-    else:
-        df_stats = df.cache()
-        df_stats.count()
+    # ── percentiles: ONE call for all numeric columns ──
+    if numeric_names:
+        try:
+            all_pcts = df_sample.stat.approxQuantile(
+                numeric_names, [0.01, 0.25, 0.5, 0.75, 0.99], 0.01)
+            for name, pcts in zip(numeric_names, all_pcts):
+                if pcts and len(pcts) == 5:
+                    result[name].update({"p01": pcts[0], "p25": pcts[1],
+                                         "p50": pcts[2], "p75": pcts[3],
+                                         "p99": pcts[4]})
+        except Exception:
+            pass
 
-    try:
-        # ── percentiles: ONE call for all numeric columns ──
-        if numeric_names:
+    # ── top values for strings: parallel from driver ──
+    if string_names:
+        def _top_values_for(name):
             try:
-                all_pcts = df_stats.stat.approxQuantile(
-                    numeric_names, [0.01, 0.25, 0.5, 0.75, 0.99], 0.01)
-                for name, pcts in zip(numeric_names, all_pcts):
-                    if pcts and len(pcts) == 5:
-                        ci = next(c for c in columns if c["name"] == name)
-                        ci.update({"p01": pcts[0], "p25": pcts[1], "p50": pcts[2],
-                                   "p75": pcts[3], "p99": pcts[4]})
+                top = (df_sample.groupBy(name).count()
+                         .orderBy(F.desc("count")).limit(TOP_K_VALUES).collect())
+                return name, [(r[name], r["count"]) for r in top]
             except Exception:
-                pass
+                return name, []
+        workers = max(1, min(PROFILE_PARALLELISM, len(string_names)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for name, tv in pool.map(_top_values_for, string_names):
+                if tv:
+                    result[name]["top_values"] = tv
 
-        # ── top values for strings: parallel queries from driver ──
-        if string_names:
-            def _top_values_for(name):
-                try:
-                    top = (df_stats.groupBy(name).count()
-                             .orderBy(F.desc("count")).limit(TOP_K_VALUES).collect())
-                    return name, [(r[name], r["count"]) for r in top]
-                except Exception:
-                    return name, []
+    return result
 
-            workers = max(1, min(PROFILE_PARALLELISM, len(string_names)))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for name, tv in pool.map(_top_values_for, string_names):
-                    if tv:
-                        ci = next(c for c in columns if c["name"] == name)
-                        ci["top_values"] = tv
 
-        # sample rows
-        sample_pd = df_stats.limit(20).toPandas()
+def profile_table(spark_session, source, label,
+                  prior_profile=None, force_rebuild=False):
+    """Full smart profile: schema, stats, entity/time/grain/completeness.
 
-        # ── structural detection ──
+    Incremental column reuse:
+      If `prior_profile` is supplied, columns whose stats are already
+      cached AND whose data type hasn't changed are reused as-is.
+      Only the truly missing or type-changed columns are re-profiled.
+      The structural-detection layer (entities/time/grain/completeness/
+      time_stats) is also reused when nothing changed and the entity/
+      time selection is the same.
+
+    Speed:
+      • Batch stats run in ONE pass over the full table (HLL distinct).
+      • Percentiles + top-values use a CACHED SAMPLE of the table.
+      • approxQuantile is batched into a single call.
+      • Top-value queries fan out across PROFILE_PARALLELISM threads.
+    """
+    if isinstance(source, str):
+        df_full = spark_session.table(source); src = source
+    else:
+        df_full = source; src = "DataFrame"
+    df_full.createOrReplaceTempView(label)
+
+    all_fields = df_full.schema.fields
+    if len(all_fields) > MAX_PROFILE_COLS:
+        print(f"    ⚠️  {len(all_fields)} cols — profiling first {MAX_PROFILE_COLS}")
+        requested_fields = all_fields[:MAX_PROFILE_COLS]
+    else:
+        requested_fields = list(all_fields)
+    requested_names = [f.name for f in requested_fields]
+    df = df_full.select(*requested_names)
+
+    # ── diff requested columns against the prior cache ──
+    cached_by_name = {}
+    if prior_profile and not force_rebuild:
+        for c in (prior_profile.get("columns") or []):
+            cached_by_name[c["name"]] = c
+
+    fields_to_profile = [
+        f for f in requested_fields
+        if (cached_by_name.get(f.name) is None
+            or cached_by_name[f.name].get("type") != str(f.dataType))
+    ]
+
+    # ── full-hit fast path: nothing to recompute ──
+    if (prior_profile is not None and not force_rebuild
+            and not fields_to_profile
+            and [c["name"] for c in (prior_profile.get("columns") or [])] == requested_names):
+        print(f"    (cached: all {len(requested_names)} cols)")
+        return prior_profile
+
+    row_count = df_full.count()
+    if row_count == 0:
+        return {"label": label, "source": src, "row_count": 0,
+                "col_count": len(requested_fields),
+                "col_count_total": len(all_fields),
+                "columns": [], "sample_rows": [], "sample_display": "",
+                "entities": [], "time_cols": [], "groupings": [],
+                "completeness": None, "grain": None, "time_stats": None}
+
+    # ── cache a working sample only if we have new cols to profile ──
+    df_sample = None
+    try:
+        if fields_to_profile:
+            if row_count > SAMPLE_FOR_STATS:
+                frac = min(1.0, SAMPLE_FOR_STATS / row_count)
+                df_sample = df.sample(fraction=frac, seed=42).cache()
+                sample_size = df_sample.count()
+                print(f"    (sampled {sample_size:,}/{row_count:,} rows; "
+                      f"profiling {len(fields_to_profile)}/{len(requested_fields)} new col(s))")
+            else:
+                df_sample = df.cache()
+                df_sample.count()
+                print(f"    (profiling {len(fields_to_profile)}/{len(requested_fields)} new col(s))")
+            new_stats = _compute_column_stats(df, df_sample, fields_to_profile, row_count)
+            cached_by_name.update(new_stats)
+        else:
+            print(f"    (cached cols, re-deriving structural layer for {len(requested_fields)} cols)")
+
+        # build columns list in requested order
+        columns = [cached_by_name[f.name] for f in requested_fields
+                   if f.name in cached_by_name]
+
+        # sample rows over the requested column set
+        if df_sample is not None:
+            sample_pd = df_sample.limit(20).toPandas()
+        else:
+            sample_pd = df.limit(20).toPandas()
+
+        # ── structural detection (cheap pure-python on `columns`) ──
         entities  = detect_entities(columns, row_count)
-        time_cols = detect_time_columns(df_stats, columns)
+        time_cols = detect_time_columns(df, columns)
         groupings = detect_groupings(columns, row_count)
 
-        # granularity + completeness (if we found both entity and time)
-        grain = None
-        completeness = None
-        time_stats = None
-        if time_cols:
-            tc = time_cols[0]
-            tc_info = next(c for c in columns if c["name"] == tc["col"])
-            grain = detect_granularity(df, tc["col"], tc_info["category"])
-            if entities:
-                ec = entities[0]["col"]
-                completeness = analyze_completeness(spark_session, df, ec, tc["col"], label)
-            if numeric_names:
-                metric_subset = numeric_names[:8]  # cap to avoid huge queries
-                time_stats = time_summary_stats(
-                    spark_session, df, tc["col"], metric_subset,
-                    entity_col=entities[0]["col"] if entities else None)
+        # ── derived layer: reuse from prior_profile when possible ──
+        new_entity = entities[0]["col"]  if entities  else None
+        new_time   = time_cols[0]["col"] if time_cols else None
+
+        prior_entity = None
+        prior_time   = None
+        if prior_profile:
+            pe = prior_profile.get("entities") or []
+            pt = prior_profile.get("time_cols") or []
+            prior_entity = (pe[0] or {}).get("col") if pe else None
+            prior_time   = (pt[0] or {}).get("col") if pt else None
+
+        reuse_derived = (
+            prior_profile is not None
+            and not fields_to_profile
+            and new_entity == prior_entity
+            and new_time   == prior_time
+        )
+
+        if reuse_derived:
+            grain        = prior_profile.get("grain")
+            completeness = prior_profile.get("completeness")
+            time_stats   = prior_profile.get("time_stats")
+        else:
+            grain = None
+            completeness = None
+            time_stats = None
+            if time_cols:
+                tc = time_cols[0]
+                tc_info = next(c for c in columns if c["name"] == tc["col"])
+                grain = detect_granularity(df, tc["col"], tc_info["category"])
+                if entities:
+                    completeness = analyze_completeness(
+                        spark_session, df, new_entity, tc["col"], label)
+                numeric_names = [c["name"] for c in columns if c["category"] == "numeric"]
+                if numeric_names:
+                    time_stats = time_summary_stats(
+                        spark_session, df, tc["col"], numeric_names[:8],
+                        entity_col=new_entity)
 
         return {
             "label": label, "source": src,
-            "row_count": row_count, "col_count": len(fields),
+            "row_count": row_count,
+            "col_count": len(columns),
+            "col_count_total": len(all_fields),
             "columns": columns,
             "sample_rows": sample_pd.head(20).to_dict(orient="records"),
             "sample_display": sample_pd.head(10).to_string(index=False, max_cols=12),
@@ -702,10 +798,11 @@ def profile_table(spark_session, source, label):
             "time_stats": time_stats,
         }
     finally:
-        try:
-            df_stats.unpersist()
-        except Exception:
-            pass
+        if df_sample is not None:
+            try:
+                df_sample.unpersist()
+            except Exception:
+                pass
 
 
 def format_profile_for_llm(p):
@@ -759,11 +856,21 @@ def format_profile_for_llm(p):
 # CELL 6: Column inference via LLM + PDFs
 # COMMAND ----------
 
-def infer_columns(profiles, pdf_chunks):
-    """Use LLM + PDF context to infer what each column means."""
+def infer_columns(profiles, pdf_chunks, existing=None):
+    """Use LLM + PDF context to infer what each column means.
+
+    `existing` (optional) is a dict of already-known col_map entries
+    keyed by 'label.col_name'.  Columns already present there are
+    SKIPPED so we don't pay LLM cost on cached columns.
+    """
+    existing = existing or {}
     col_list = []
+    todo_keys = []
     for p in profiles.values():
         for c in p["columns"]:
+            key = f"{p['label']}.{c['name']}"
+            if key in existing:
+                continue
             sample = ""
             if c.get("top_values"):
                 sample = str([v for v, _ in c["top_values"][:5]])
@@ -773,10 +880,14 @@ def infer_columns(profiles, pdf_chunks):
                 sample = f"{c.get('min')} .. {c.get('max')}"
             col_list.append(f"  {p['label']}.{c['name']}  type={c['type']}  "
                             f"distinct={c['distinct']}  sample={sample}")
+            todo_keys.append(key)
+
+    if not col_list:
+        return {}
 
     pdf_context = ""
     if pdf_chunks:
-        kw = [c["name"] for p in profiles.values() for c in p["columns"]]
+        kw = [k.split(".", 1)[-1] for k in todo_keys]
         pdf_context = relevant_chunks(pdf_chunks, kw[:20], top_k=5)
 
     prompt = f"""Given these table columns with sample values, infer what each one
@@ -1129,8 +1240,10 @@ def analyze(spark_session, tables, pdfs=None, user_prompt="",
     cache_dir / force_rebuild default to the module-level
     CONTEXT_CACHE_DIR / FORCE_REBUILD_CONTEXT settings.  Profiles
     and col-map entries are cached per (table_address, schema)
-    so repeat runs against the same table skip profiling and
-    LLM column inference entirely.
+    at the COLUMN level — repeat runs reuse already-profiled
+    columns and only do work for new or type-changed columns.
+    Widening MAX_PROFILE_COLS between runs adds the new columns
+    incrementally instead of reprofiling the whole table.
     """
     if cache_dir is None:
         cache_dir = CONTEXT_CACHE_DIR
@@ -1145,33 +1258,40 @@ def analyze(spark_session, tables, pdfs=None, user_prompt="",
         "notebook_path": None,
     }
 
-    # ── Phase 1: Profile (with context cache) ──
+    # ── Phase 1: Profile (with incremental, column-level cache) ──
     print("📊 Phase 1 — Profiling tables...")
-    new_labels = []      # labels that need col-map inference
-    table_schemas = {}   # label → (source, schema) for cache writes later
+    table_schemas = {}              # label → (source, schema) for cache writes later
+    table_changed = {}              # label → bool (cache write needed?)
     for label, source in tables.items():
-        # cache lookup (only for string sources — DataFrames have no stable address)
-        cached = None
-        if isinstance(source, str) and not force_rebuild:
+        cached_payload = None
+        if isinstance(source, str):
             df_probe = spark_session.table(source)
             df_probe.createOrReplaceTempView(label)  # restore view for downstream SQL
             table_schemas[label] = (source, df_probe.schema)
-            cached = load_context(cache_dir, source, df_probe.schema)
+            if not force_rebuild:
+                cached_payload = load_context(cache_dir, source, df_probe.schema)
 
-        if cached:
-            p = cached["profile"]
-            results["profiles"][label] = p
-            results["col_map"].update(cached.get("col_map_entries") or {})
-            results["completeness"][label] = p.get("completeness")
-            print(f"  ⚡ {label}  (cached: {p['row_count']:,} rows × {p['col_count']} cols)")
-            continue
+        prior_profile = (cached_payload or {}).get("profile")
+        prior_col_map = (cached_payload or {}).get("col_map_entries") or {}
+        results["col_map"].update(prior_col_map)
 
         print(f"  🔄 {label}...", end=" ", flush=True)
-        p = profile_table(spark_session, source, label)
+        p = profile_table(spark_session, source, label,
+                          prior_profile=prior_profile,
+                          force_rebuild=force_rebuild)
         results["profiles"][label] = p
-        new_labels.append(label)
-        if isinstance(source, str) and label not in table_schemas:
-            table_schemas[label] = (source, spark_session.table(source).schema)
+        results["completeness"][label] = p.get("completeness")
+
+        # mark cache as needing update if any current column wasn't in
+        # the prior cache, or if prior was missing entirely
+        prior_names = {c["name"] for c in (prior_profile or {}).get("columns", [])}
+        cur_names   = {c["name"] for c in p.get("columns", [])}
+        table_changed[label] = (
+            prior_profile is None
+            or cur_names != prior_names
+            or p.get("row_count") != (prior_profile or {}).get("row_count")
+        )
+
         print(f"✅ {p['row_count']:,} rows × {p['col_count']} cols")
         if p.get("entities"):
             print(f"    entity key: {p['entities'][0]['col']}")
@@ -1183,7 +1303,6 @@ def analyze(spark_session, tables, pdfs=None, user_prompt="",
                   f"fill={c['fill_rate_pct']}%")
         if p.get("groupings"):
             print(f"    groupings:  {', '.join(g['col'] for g in p['groupings'][:4])}")
-        results["completeness"][label] = p.get("completeness")
 
     profiles_text = "\n\n".join(format_profile_for_llm(p) for p in results["profiles"].values())
     table_labels = list(results["profiles"].keys())
@@ -1207,27 +1326,41 @@ def analyze(spark_session, tables, pdfs=None, user_prompt="",
         print(f"  ✅ {len(results['benchmarks'])} benchmarks, "
               f"{len(results['chart_references'])} chart refs")
 
-    # ── Phase 3: Column inference (new tables only) ──
-    if new_labels:
-        print(f"\n🏷️  Phase 3 — Inferring column meanings for {len(new_labels)} new table(s)...")
-        new_profiles = {l: results["profiles"][l] for l in new_labels}
-        new_col_map  = infer_columns(new_profiles, all_chunks)
+    # ── Phase 3: Column inference (incremental — only missing columns) ──
+    # Build the union of "label.col" keys present in current profiles, then
+    # ask the LLM only about the keys that aren't already in the cached map.
+    needed_keys = set()
+    for label, p in results["profiles"].items():
+        for c in p.get("columns", []):
+            needed_keys.add(f"{label}.{c['name']}")
+    missing_keys = needed_keys - set(results["col_map"].keys())
+
+    if missing_keys:
+        # filter profiles down to tables that have at least one missing col
+        labels_with_gaps = {k.split(".", 1)[0] for k in missing_keys}
+        gap_profiles = {l: results["profiles"][l] for l in labels_with_gaps}
+        print(f"\n🏷️  Phase 3 — Inferring meanings for {len(missing_keys)} new column(s) "
+              f"across {len(labels_with_gaps)} table(s)...")
+        new_col_map = infer_columns(gap_profiles, all_chunks,
+                                    existing=results["col_map"])
         results["col_map"].update(new_col_map)
+        # any table that received new entries needs its cache rewritten
+        for label in labels_with_gaps:
+            table_changed[label] = True
         print(f"  ✅ {len(new_col_map)} new columns mapped "
               f"({len(results['col_map'])} total)")
-
-        # ── persist cache for newly profiled tables ──
-        for label in new_labels:
-            if label not in table_schemas:
-                continue
-            src, schema = table_schemas[label]
-            entries = {k: v for k, v in new_col_map.items()
-                       if k.startswith(f"{label}.")}
-            save_context(cache_dir, src, schema,
-                         results["profiles"][label], entries)
     else:
-        print(f"\n🏷️  Phase 3 — All tables cached, skipping column inference "
+        print(f"\n🏷️  Phase 3 — All columns cached, skipping LLM inference "
               f"({len(results['col_map'])} columns mapped from cache)")
+
+    # ── persist cache for any table that profiled new cols OR got new col-map entries ──
+    for label, (src, schema) in table_schemas.items():
+        if not table_changed.get(label):
+            continue
+        entries = {k: v for k, v in results["col_map"].items()
+                   if k.startswith(f"{label}.")}
+        save_context(cache_dir, src, schema,
+                     results["profiles"][label], entries)
 
     for key, info in list(results["col_map"].items())[:8]:
         print(f"    {key:<35s} → {info.get('meaning','?')[:50]}")
