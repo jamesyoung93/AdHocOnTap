@@ -17,6 +17,10 @@ Both datasets are 100% synthetic — generated from a fixed seed in the demo's `
 
 ## Quick start
 
+> Running in a Jupyter notebook (local Jupyter, JupyterLab, VS Code, or Colab)? **Skip this section** and jump to [Running in a notebook](#running-in-a-notebook) — the commands below are for a terminal. In a notebook you need `%cd` magic (not plain `cd`) and `!` prefixes on shell commands.
+
+### Terminal (bash / zsh / PowerShell)
+
 ```bash
 # 1. Clone the repo and enter it
 git clone https://github.com/jamesyoung93/AdHocOnTap.git
@@ -152,30 +156,39 @@ The local demo stack is intentionally separate from the Databricks notebook (`ad
 
 ---
 
-## Running on Google Colab
+## Running in a notebook
 
-Each demo also runs unchanged in Colab. In a fresh notebook:
+Works unchanged in **any Jupyter environment** — local Jupyter, JupyterLab, VS Code notebook, or Google Colab. Two things to know:
+
+- Use `%cd` (the IPython magic) — **not** plain `cd`. `!cd foo` only changes directory inside that one subshell and the next `!python` call lands back at the original cwd, so you'll get "file not found".
+- Use `!python script.py` (or `%run script.py`) to execute the demo scripts. **Don't** `exec(open(...).read())` — the scripts use `__file__` to locate their data/output folders, and `__file__` isn't defined inside an `exec()` call.
 
 ```python
-# Cell 1 — clone the repo + install
+# Cell 1 — clone and install (one time per environment)
 !git clone https://github.com/jamesyoung93/AdHocOnTap.git
 %cd AdHocOnTap
 !pip install -q -r demos/requirements.txt
 !pip install -q --no-deps https://github.com/jamesyoung93/deck-builder/raw/master/deck_builder-0.2.0-py3-none-any.whl
 
-# Cell 2 — set your API key (Gemini's free tier is the easiest in Colab)
+# Cell 2 — set your API key.  Gemini's free tier is the easiest path on Colab.
 import os
 os.environ["GEMINI_API_KEY"] = "..."  # paste from https://aistudio.google.com/app/apikey
 
-# Cell 3 — run the demo
+# Cell 3 — run the demo (note %cd, not cd)
 %cd demos/demo_01_account_activity
 !python 01_generate_data.py
 !python 02_run_pipeline.py
 
-# Cell 4 — download the resulting deck
+# Cell 4 — open the resulting deck
+# Colab:
 from google.colab import files
 files.download("output/deck.pptx")
+# Local Jupyter / VS Code — just open the file:
+import os; os.startfile("output/deck.pptx")   # Windows
+# (on macOS:  !open output/deck.pptx   ; on Linux:  !xdg-open output/deck.pptx )
 ```
+
+If you **just restarted the kernel** partway through, your working directory resets — re-run the `%cd` cells before running the pipeline again.
 
 ---
 
