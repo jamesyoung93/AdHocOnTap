@@ -31,9 +31,24 @@ python 02_run_pipeline.py         # profile → LLM → deck → archive
 ## What the analyzer should detect (without being told)
 
 - **Entity key** = `store_id` (and on the panel table, the de facto grain is `store_id × category_id × week_start`)
-- **Time column** = `week_start` (auto-detected as `YYYY-MM-DD` daily-like → `irregular(median_gap=7d)` which the analyzer reads as weekly)
+- **Time column** = `week_start` (`YYYY-MM-DD`, detected as `weekly` from a 7-day median gap)
 - **Groupings** = `region` (5), `store_format` (3), `category_id` (8), `promo_flag` (2)
-- **Panel** = a high-fill but non-100% panel because of late-opened and churned stores
+- **Panel** = ~94.8% fill, mixed history (late-opened and churned stores)
+
+## QC step — this demo is deliberately dirty
+
+`01_generate_data.py` injects four quality issues so the AI-assisted QC step has things to find on video. They are flagged in the data generator with `INJECT_QC_ISSUES = True` (set False for a clean run):
+
+| Issue | What's in the data | What the QC will say |
+|-------|-------------------|----------------------|
+| Null primary keys | 3 rows in `store_master` have `store_id = NULL` | **BLOCKER** — pipeline would pause. AI fix: `stores = stores.dropna(subset=['store_id'])` |
+| Duplicate primary keys | 2 rows are exact duplicates of existing stores | **WARNING** — AI fix: `stores = stores.drop_duplicates(subset=['store_id'], keep='first')` |
+| Mixed-case categoricals | 20 rows have `store_format = "express"` instead of `"Express"` | **WARNING** (LLM-assisted finding) — human action: normalize case before grouping |
+| Orphan foreign key | 5 rows in `store_week_sales` reference `STORE_GHOST` (not in master) | **INFO** — orphan FK between sales and stores |
+
+You'll also see a high-null-rate WARNING on `remodel_year` (~37% null by design — most stores haven't been remodeled).
+
+The expected output: **AI Readiness Score around 60/100**, 1 blocker, 3 warnings, 1 info. The pipeline prints "PIPELINE WOULD PAUSE" but `FORCE_CONTINUE_PAST_BLOCKERS = True` in the script overrides it so the deck still builds — this is the moment in the video to explain "in production you'd set this to False, fix the data, and re-run".
 
 ## What you get in `output/`
 

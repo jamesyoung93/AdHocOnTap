@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from shared.local_analyzer    import analyze
 from shared.llm_client        import LLMClient, get_call_llm_fn
+from shared.data_qc           import run_qc, print_qc_report, has_blockers
 from shared.analyzer_to_deck  import build_deck_from_results
 from shared.archive           import build_archive
 
@@ -45,6 +46,10 @@ actual quarterly engagements against the per-region targets where possible.
 """.strip()
 
 DECK_STYLE = "executive_dark"   # executive_dark | corporate_clean | accent_green | neutral
+
+# QC behavior — set False to halt the pipeline when BLOCKERs are found.
+# (Demo 1's data is clean, so this never trips here. Demo 2 has injected issues.)
+FORCE_CONTINUE_PAST_BLOCKERS = True
 
 
 def main():
@@ -70,17 +75,26 @@ def main():
     print(f"       provider={client.provider}  model={client.model}")
     call_llm = get_call_llm_fn(client)
 
-    # ── 3. Run the pipeline ──
+    # ── 3. Profile + LLM analysis ──
     print("\n" + "=" * 64)
     results = analyze(tables, user_prompt=USER_PROMPT, llm_call=call_llm)
     print("=" * 64)
 
-    # ── 4. Build the deck ──
+    # ── 4. AI-assisted QC + FAIR scoring ──
+    qc = run_qc(tables, results, llm_call=call_llm)
+    print_qc_report(qc)
+
+    if has_blockers(qc) and not FORCE_CONTINUE_PAST_BLOCKERS:
+        print("\n[halt] FORCE_CONTINUE_PAST_BLOCKERS=False — pausing pipeline.")
+        print("       Fix the data and re-run, or set FORCE_CONTINUE_PAST_BLOCKERS=True to override.")
+        sys.exit(2)
+
+    # ── 5. Build the deck ──
     print("\n[deck] building PowerPoint via deck-builder...")
     deck_path = OUTPUT_DIR / "deck.pptx"
     try:
         from slide_engine.pptx_builder import PptxBuilder
-        deck = build_deck_from_results(results, project_name=PROJECT_NAME, style=DECK_STYLE)
+        deck = build_deck_from_results(results, qc=qc, project_name=PROJECT_NAME, style=DECK_STYLE)
         PptxBuilder().build(deck, str(deck_path))
         print(f"       wrote {deck_path}")
     except ImportError:
@@ -92,12 +106,13 @@ def main():
         print(f"       deck build failed: {e}")
         deck_path = None
 
-    # ── 5. Archive ──
+    # ── 6. Archive ──
     print("\n[bundle] packing archive...")
     zip_path = build_archive(
         output_dir   = str(OUTPUT_DIR),
         project_name = PROJECT_NAME,
         results      = results,
+        qc           = qc,
         deck_path    = str(deck_path) if deck_path else None,
     )
 

@@ -35,6 +35,10 @@ This is the moment that makes the video — call it out as it prints:
 - **Groupings** = `region_code` (5), `category` (3), `tier` (4), `active_flag` (2)
 - **Panel** = ~5,000 entities × 10 periods, with a fill rate <100% (because lower-tier accounts churn) — this is the structural finding the deck calls out
 
+## QC step
+
+This demo's data is **clean** by design — the QC step should report 0 blockers and a high AI Readiness score (around 95–100). Use it as the contrast to demo 2, which deliberately has issues. The QC slides will still appear in the deck (FAIR callouts + a sparse "all green" findings slide).
+
 ## What you get in `output/`
 
 ```

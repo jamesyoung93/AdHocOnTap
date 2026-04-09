@@ -24,6 +24,7 @@ from pathlib import Path
 def build_archive(output_dir: str,
                   project_name: str,
                   results: dict,
+                  qc: dict | None = None,
                   deck_path: str | None = None,
                   extra_files: list | None = None) -> str:
     """Build a timestamped folder + .zip bundle. Returns the .zip path."""
@@ -41,6 +42,13 @@ def build_archive(output_dir: str,
         "tables":            list(results.get("profiles", {}).keys()),
         "code_cell_count":   len(results.get("code_cells", [])),
         "insight_count":     len(results.get("insights", [])),
+        "qc": ({
+            "ai_readiness_score": qc.get("ai_readiness_score"),
+            "fair_scores":        qc.get("fair_scores"),
+            "blocker_count":      len(qc.get("blockers", [])),
+            "warning_count":      len(qc.get("warnings", [])),
+            "info_count":         len(qc.get("info", [])),
+        } if qc else None),
         "git_sha":           _git_sha(),
     }
     (bundle_root / "manifest.json").write_text(
@@ -110,6 +118,12 @@ def build_archive(output_dir: str,
             json.dumps(results["insights"], indent=2, default=str), encoding="utf-8"
         )
 
+    # ── 5b. QC report (FAIR scores + findings + recommendations) ──
+    if qc:
+        (bundle_root / "qc_report.json").write_text(
+            json.dumps(qc, indent=2, default=str), encoding="utf-8"
+        )
+
     # ── 6. The deck itself ──
     if deck_path and Path(deck_path).exists():
         shutil.copy2(deck_path, bundle_root / "deck.pptx")
@@ -141,6 +155,8 @@ def build_archive(output_dir: str,
         print(f"    all_cells.py")
     if results.get("insights"):
         print(f"    insights.json")
+    if qc:
+        print(f"    qc_report.json            (FAIR + findings + recommendations)")
     if deck_path:
         print(f"    deck.pptx")
     if extra_files:

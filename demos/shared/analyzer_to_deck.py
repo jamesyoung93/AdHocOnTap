@@ -23,12 +23,14 @@ from slide_engine.schema import (
 
 def build_deck_from_results(results: dict,
                             project_name: str,
+                            qc: dict | None = None,
                             style: str = "executive_dark",
                             subtitle: str | None = None) -> Deck:
     """Construct a Deck from local_analyzer.analyze() output.
 
     results : dict from local_analyzer.analyze()
     project_name : title for the deck
+    qc : optional dict from data_qc.run_qc() — adds AI-readiness slides
     style : executive_dark | corporate_clean | accent_green | neutral
     subtitle : optional subtitle override (defaults to today's date)
     """
@@ -80,6 +82,70 @@ def build_deck_from_results(results: dict,
         bullets = summary_bullets[:6],
         source = "AdHocOnTap automatic profiler",
     ))
+
+    # ── 3b. AI Readiness (FAIR scores) ──
+    if qc and qc.get("fair_scores"):
+        f = qc["fair_scores"]
+        ai = qc.get("ai_readiness_score", 0)
+        readiness_label = (
+            "Ready for analysis"   if ai >= 80 else
+            "Usable with caveats"  if ai >= 60 else
+            "Needs cleanup first"  if ai >= 40 else
+            "Not AI-ready"
+        )
+        deck.add_slide(Slide(
+            type  = SlideType.DATA_CALLOUT,
+            title = f"Data AI Readiness: {ai}/100 — {readiness_label}",
+            callouts = [
+                DataCallout(value=f"{f['findable']}",      label="Findable",      context="meaningful names + keys + docs"),
+                DataCallout(value=f"{f['accessible']}",    label="Accessible",    context="readable, no encoding issues"),
+                DataCallout(value=f"{f['interoperable']}", label="Interoperable", context="standard types + valid joins"),
+                DataCallout(value=f"{f['reusable']}",      label="Reusable",      context="documented, no severe issues"),
+            ],
+            source = "FAIR scoring (auto + LLM-assisted)",
+        ))
+
+    # ── 3c. QC findings: blockers vs warnings ──
+    if qc and (qc.get("blockers") or qc.get("warnings")):
+        blockers = qc.get("blockers", [])
+        warnings = qc.get("warnings", [])
+        cols = []
+        if blockers:
+            cols.append(ColumnContent(
+                heading = f"Blockers ({len(blockers)})",
+                bullets = [f"{b['title']}: {b['detail']}" for b in blockers[:5]],
+            ))
+        if warnings:
+            cols.append(ColumnContent(
+                heading = f"Warnings ({len(warnings)})",
+                bullets = [f"{w['title']}: {w['detail']}" for w in warnings[:5]],
+            ))
+        if cols:
+            title = ("Pipeline would pause — blockers must be fixed first"
+                     if blockers else "Quality flags to review before sharing")
+            deck.add_slide(Slide(
+                type    = SlideType.TWO_COLUMN,
+                title   = title,
+                columns = cols,
+                source  = "Automated QC + AI-assisted scan",
+            ))
+
+    # ── 3d. LLM-prioritized recommendations from QC ──
+    if qc and qc.get("recommendations"):
+        recs = qc["recommendations"][:5]
+        deck.add_slide(Slide(
+            type     = SlideType.ACTION_BULLETS,
+            title    = "Prioritized data fixes",
+            subtitle = "Highest-impact first",
+            bullets  = [
+                BulletPoint(
+                    lead   = f"{r.get('title','')}  [{r.get('effort','?')}]",
+                    detail = r.get("rationale", ""),
+                )
+                for r in recs
+            ],
+            source = "LLM-distilled QC recommendations",
+        ))
 
     # ── 4. Data callout: panel structure for the primary table ──
     primary = next((p for p in profiles.values() if p.get("completeness")), None)

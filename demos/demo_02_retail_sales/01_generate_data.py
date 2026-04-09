@@ -109,6 +109,27 @@ def main():
 
     store_week_sales = pd.DataFrame(rows)
 
+    # ── inject some QC issues so the data_qc step has things to find ──
+    # (the video shows the QC catching real issues; flip these off for a clean run)
+    INJECT_QC_ISSUES = True
+    if INJECT_QC_ISSUES:
+        # 1. null primary keys (BLOCKER) — wipe a few store_ids on the master
+        null_idxs = rng.choice(len(store_master), size=3, replace=False)
+        store_master.loc[null_idxs, "store_id"] = None
+
+        # 2. duplicate primary keys (WARNING) — clone two existing rows
+        dup_rows = store_master.iloc[[10, 200]].copy()
+        store_master = pd.concat([store_master, dup_rows], ignore_index=True)
+
+        # 3. mixed-case categoricals (AI-assisted finding) — make some lowercase
+        store_master.loc[rng.choice(len(store_master), size=20, replace=False), "store_format"] = "express"
+
+        # 4. orphan FK on the sales side — sneak in a fake store_id that
+        #    doesn't exist in the master
+        orphan_rows = store_week_sales.iloc[:5].copy()
+        orphan_rows["store_id"] = "STORE_GHOST"
+        store_week_sales = pd.concat([store_week_sales, orphan_rows], ignore_index=True)
+
     # ── save ──
     store_master.to_csv(OUT_DIR / "store_master.csv",         index=False)
     category_master.to_csv(OUT_DIR / "category_master.csv",   index=False)
