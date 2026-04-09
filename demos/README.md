@@ -15,29 +15,36 @@ Both datasets are 100% synthetic — generated from a fixed seed in the demo's `
 
 ---
 
-## Quick start (5 commands)
+## Quick start
 
 ```bash
-# 1. Install Python deps
+# 1. Clone the repo and enter it
+git clone https://github.com/jamesyoung93/AdHocOnTap.git
+cd AdHocOnTap
+
+# 2. Install Python deps (run from the AdHocOnTap repo root)
 pip install -r demos/requirements.txt
 
-# 2. Install deck-builder (the wheel)
+# 3. Install deck-builder (the wheel — dependencies already installed in step 2)
 pip install --no-deps https://github.com/jamesyoung93/deck-builder/raw/master/deck_builder-0.2.0-py3-none-any.whl
 
-# 3. Pick an LLM provider (pick ONE — see "LLM providers" below for free options)
+# 4. Pick an LLM provider (pick ONE — see "LLM providers" below for free options)
 export ANTHROPIC_API_KEY=sk-ant-...
 # OR
-export GEMINI_API_KEY=...     # free tier
+export GEMINI_API_KEY=...      # free tier
 # OR
 export GROQ_API_KEY=gsk_...    # free tier
+# Windows PowerShell equivalent:  $env:GEMINI_API_KEY = "..."
 
-# 4. Generate the synthetic data + run the pipeline
+# 5. Generate the synthetic data + run the pipeline
 cd demos/demo_01_account_activity
 python 01_generate_data.py
 python 02_run_pipeline.py
 ```
 
 The output `.zip` lands in `demos/demo_01_account_activity/output/`.
+
+> **No `pip install .` needed.** The demos import the shared modules via `sys.path` (see the `sys.path.insert(...)` at the top of each `02_run_pipeline.py`), so there's no packaging step for AdHocOnTap itself — just clone and run.
 
 ---
 

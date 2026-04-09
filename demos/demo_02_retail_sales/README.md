@@ -17,15 +17,19 @@ The data has a built-in **20% sinusoidal seasonal pattern** across the year so t
 ## Run it
 
 ```bash
-# from the repo root
+# One-time setup — clone the repo and install deps
+git clone https://github.com/jamesyoung93/AdHocOnTap.git
+cd AdHocOnTap
 pip install -r demos/requirements.txt
 pip install --no-deps https://github.com/jamesyoung93/deck-builder/raw/master/deck_builder-0.2.0-py3-none-any.whl
 
-export GEMINI_API_KEY=...   # or any other supported provider
+# Set a provider API key (free options: GEMINI_API_KEY, GROQ_API_KEY)
+export GEMINI_API_KEY=...
 
+# Run this demo
 cd demos/demo_02_retail_sales
 python 01_generate_data.py        # writes the CSVs to ./data/
-python 02_run_pipeline.py         # profile → LLM → deck → archive
+python 02_run_pipeline.py         # profile → QC → deck → archive
 ```
 
 ## What the analyzer should detect (without being told)
