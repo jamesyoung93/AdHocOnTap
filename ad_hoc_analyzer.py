@@ -82,6 +82,22 @@ TEMPERATURE        = 0.2
 MAX_PROFILE_COLS   = 60
 TOP_K_VALUES       = 10
 
+# ── Profiling speed knobs ──────────────────────────────────
+# For tables larger than SAMPLE_FOR_STATS rows, percentiles and
+# top-value queries run against a cached random sample instead
+# of the full table.  Batch stats (null/distinct/min/max/mean/std)
+# still run over the full table in a single pass.
+SAMPLE_FOR_STATS     = 500_000
+PROFILE_PARALLELISM  = 8      # driver threads for per-column top-value queries
+
+# ── Context cache ──────────────────────────────────────────
+# Profiles + column inferences are cached per (table_address, schema)
+# so repeat runs against the same table skip the expensive profiling
+# and LLM column-inference steps entirely.  Delete the dir or set
+# FORCE_REBUILD_CONTEXT=True to invalidate.
+CONTEXT_CACHE_DIR       = "/dbfs/FileStore/ad_hoc_analyzer_cache"
+FORCE_REBUILD_CONTEXT   = False
+
 
 # COMMAND ----------
 # CELL 2: Imports
@@ -91,6 +107,7 @@ import json, os, re, time, hashlib, html as html_mod, textwrap
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pyspark.sql import functions as F, Window
 from pyspark.sql.types import (
     StringType, IntegerType, LongType, ShortType, ByteType,
@@ -191,6 +208,97 @@ def pdf_summary(chunks, n=400):
     return "\n".join(
         f"[{i+1}] {c[:n].replace(chr(10),' ').strip()}..."
         for i, c in enumerate(chunks[:50]))
+
+
+# COMMAND ----------
+# CELL 4b: Context cache
+# ============================================================
+#  Persists profiles + column inferences per (table_address, schema)
+#  so repeat runs reuse the expensive profiling and LLM column
+#  inference work.  Cache invalidates automatically if the table's
+#  schema changes; force a rebuild via FORCE_REBUILD_CONTEXT or
+#  clear_context_cache().
+# ============================================================
+
+def _context_cache_key(source, schema):
+    h = hashlib.sha256()
+    h.update(str(source).encode("utf-8"))
+    h.update(schema.json().encode("utf-8"))
+    return h.hexdigest()[:16]
+
+def _cache_path(cache_dir, key):
+    return os.path.join(cache_dir, f"{key}.json")
+
+def load_context(cache_dir, source, schema):
+    """Return cached {profile, col_map_entries} dict, or None."""
+    if not cache_dir:
+        return None
+    key = _context_cache_key(source, schema)
+    path = _cache_path(cache_dir, key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"    ⚠️  cache read failed ({e}) — will rebuild")
+        return None
+
+def save_context(cache_dir, source, schema, profile, col_map_entries):
+    """Write a cache entry for one table."""
+    if not cache_dir:
+        return
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        key = _context_cache_key(source, schema)
+        payload = {
+            "version": 1,
+            "cached_at": datetime.utcnow().isoformat(),
+            "source": str(source),
+            "schema_hash": key,
+            "profile": profile,
+            "col_map_entries": col_map_entries,
+        }
+        with open(_cache_path(cache_dir, key), "w") as f:
+            json.dump(payload, f, default=str)
+    except Exception as e:
+        print(f"    ⚠️  cache write failed: {e}")
+
+def clear_context_cache(cache_dir=None):
+    """Wipe all cached profiles. Call after a table is rewritten in place."""
+    d = cache_dir or CONTEXT_CACHE_DIR
+    if not os.path.exists(d):
+        print(f"  (no cache at {d})"); return
+    removed = 0
+    for fn in os.listdir(d):
+        if fn.endswith(".json"):
+            os.remove(os.path.join(d, fn)); removed += 1
+    print(f"  cleared {removed} cache entries from {d}")
+
+def list_context_cache(cache_dir=None):
+    """List cached tables and when they were profiled."""
+    d = cache_dir or CONTEXT_CACHE_DIR
+    if not os.path.exists(d):
+        print(f"  (no cache at {d})"); return []
+    entries = []
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn)) as f:
+                p = json.load(f)
+            entries.append({
+                "source":    p.get("source"),
+                "cached_at": p.get("cached_at"),
+                "cols":      (p.get("profile") or {}).get("col_count"),
+                "rows":      (p.get("profile") or {}).get("row_count"),
+            })
+        except Exception:
+            pass
+    for e in entries:
+        print(f"  {e['cached_at']}  {e['source']}  "
+              f"({e['rows']:,} rows × {e['cols']} cols)")
+    return entries
 
 
 # COMMAND ----------
@@ -346,49 +454,68 @@ def detect_groupings(columns, row_count):
 # ── Panel completeness ──
 
 def analyze_completeness(spark_session, df, entity_col, time_col, label):
-    """How complete is the entity × time panel?"""
-    n_entities = df.select(entity_col).distinct().count()
-    periods_df = df.select(time_col).distinct().orderBy(time_col)
-    n_periods  = periods_df.count()
-    period_list = [str(r[0]) for r in periods_df.collect()]
+    """How complete is the entity × time panel?
 
-    expected = n_entities * n_periods
-    actual   = df.select(entity_col, time_col).distinct().count()
-    fill     = round(actual / expected * 100, 2) if expected else 0
+    Speed: project down to distinct (entity, time) pairs once and cache.
+    All subsequent counts/groupBy run against this much smaller table.
+    """
+    pair = (df.select(entity_col, time_col)
+              .where(F.col(entity_col).isNotNull() & F.col(time_col).isNotNull())
+              .distinct()
+              .cache())
+    try:
+        actual = pair.count()  # materializes the cache
 
-    # per-entity: how many periods present?
-    ent_comp = (df.groupBy(entity_col)
-                  .agg(F.countDistinct(time_col).alias("periods_present")))
-    ent_stats = ent_comp.select(
-        F.min("periods_present").alias("min"),
-        F.max("periods_present").alias("max"),
-        F.mean("periods_present").alias("mean"),
-        F.expr("percentile_approx(periods_present, 0.5)").alias("median"),
-    ).collect()[0]
+        period_rows = pair.select(time_col).distinct().orderBy(time_col).collect()
+        period_list = [str(r[0]) for r in period_rows]
+        n_periods   = len(period_list)
 
-    fully_complete = ent_comp.filter(F.col("periods_present") == n_periods).count()
+        n_entities  = pair.select(entity_col).distinct().count()
 
-    # per-period: how many entities?
-    per_period = (df.groupBy(time_col)
-                    .agg(F.countDistinct(entity_col).alias("entity_count"))
-                    .orderBy(time_col)
-                    .toPandas().to_dict(orient="records"))
+        expected = n_entities * n_periods
+        fill     = round(actual / expected * 100, 2) if expected else 0
 
-    return {
-        "entity_col": entity_col, "time_col": time_col,
-        "n_entities": n_entities, "n_periods": n_periods,
-        "period_range": [period_list[0], period_list[-1]] if period_list else [],
-        "periods": period_list,
-        "expected_cells": expected, "actual_cells": actual,
-        "fill_rate_pct": fill,
-        "entities_fully_complete": fully_complete,
-        "entities_fully_complete_pct": round(fully_complete / n_entities * 100, 1) if n_entities else 0,
-        "entity_period_stats": {
-            "min": ent_stats["min"], "max": ent_stats["max"],
-            "mean": _rnd(ent_stats["mean"], 1), "median": ent_stats["median"],
-        },
-        "per_period_entity_counts": per_period,
-    }
+        # per-entity period stats + fully-complete count in ONE pass
+        ent_stats = (pair.groupBy(entity_col)
+                         .agg(F.count("*").alias("periods_present"))
+                         .agg(
+                             F.min("periods_present").alias("min"),
+                             F.max("periods_present").alias("max"),
+                             F.mean("periods_present").alias("mean"),
+                             F.expr("percentile_approx(periods_present, 0.5)").alias("median"),
+                             F.sum(F.when(F.col("periods_present") == n_periods, 1)
+                                    .otherwise(0)).alias("fully_complete"),
+                         )
+                         .collect()[0])
+
+        fully_complete = ent_stats["fully_complete"] or 0
+
+        # per-period entity counts (cached pair → tiny table)
+        per_period = (pair.groupBy(time_col)
+                          .agg(F.count("*").alias("entity_count"))
+                          .orderBy(time_col)
+                          .toPandas().to_dict(orient="records"))
+
+        return {
+            "entity_col": entity_col, "time_col": time_col,
+            "n_entities": n_entities, "n_periods": n_periods,
+            "period_range": [period_list[0], period_list[-1]] if period_list else [],
+            "periods": period_list,
+            "expected_cells": expected, "actual_cells": actual,
+            "fill_rate_pct": fill,
+            "entities_fully_complete": fully_complete,
+            "entities_fully_complete_pct": round(fully_complete / n_entities * 100, 1) if n_entities else 0,
+            "entity_period_stats": {
+                "min": ent_stats["min"], "max": ent_stats["max"],
+                "mean": _rnd(ent_stats["mean"], 1), "median": ent_stats["median"],
+            },
+            "per_period_entity_counts": per_period,
+        }
+    finally:
+        try:
+            pair.unpersist()
+        except Exception:
+            pass
 
 
 # ── Time-aware summary stats ──
@@ -415,7 +542,19 @@ def time_summary_stats(spark_session, df, time_col, metric_cols, entity_col=None
 # ── Main profiler ──
 
 def profile_table(spark_session, source, label):
-    """Full smart profile: schema, stats, entity/time/grain/completeness."""
+    """Full smart profile: schema, stats, entity/time/grain/completeness.
+
+    Speed notes:
+      • Batch stats run in ONE pass over the full table.  We use
+        approx_count_distinct (HLL) instead of exact countDistinct
+        — same single pass, much cheaper on wide tables.
+      • Percentiles and top-values run against a CACHED SAMPLE of
+        the table (configurable via SAMPLE_FOR_STATS).  Sample is
+        unpersisted before we return.
+      • All approxQuantile calls are batched into ONE Spark job.
+      • Per-column top-value queries run concurrently from the
+        driver via a thread pool — N queries become roughly N/k.
+    """
     if isinstance(source, str):
         df = spark_session.table(source); src = source
     else:
@@ -435,13 +574,13 @@ def profile_table(spark_session, source, label):
                 "entities": [], "time_cols": [], "groupings": [],
                 "completeness": None, "grain": None, "time_stats": None}
 
-    # ── batch stats ──
+    # ── batch stats: ONE pass over full table (approx distincts) ──
     exprs = []
     for i, f in enumerate(fields):
         cn = f.name
         exprs += [
             F.count(F.when(F.col(cn).isNull(), True)).alias(f"_{i}_n"),
-            F.countDistinct(cn).alias(f"_{i}_d"),
+            F.approx_count_distinct(cn, rsd=0.05).alias(f"_{i}_d"),
         ]
         if isinstance(f.dataType, _NUM):
             exprs += [F.min(cn).alias(f"_{i}_mi"), F.max(cn).alias(f"_{i}_mx"),
@@ -458,6 +597,7 @@ def profile_table(spark_session, source, label):
 
     columns = []
     numeric_names = []
+    string_names  = []
     for i, f in enumerate(fields):
         info = {"name": f.name, "type": str(f.dataType), "nullable": f.nullable,
                 "null_count": batch[f"_{i}_n"] or 0,
@@ -475,69 +615,97 @@ def profile_table(spark_session, source, label):
             info["category"] = "string"
             info.update({"min_length": batch[f"_{i}_lmi"], "max_length": batch[f"_{i}_lmx"],
                          "avg_length": _rnd(batch[f"_{i}_lmu"], 1)})
+            string_names.append(f.name)
         elif isinstance(f.dataType, BooleanType):
             info["category"] = "boolean"
         else:
             info["category"] = "complex"
         columns.append(info)
 
-    # percentiles
-    for col_info in columns:
-        if col_info["category"] == "numeric":
-            try:
-                pcts = df.approxQuantile(col_info["name"], [0.01,.25,.5,.75,.99], 0.01)
-                if pcts and len(pcts) == 5:
-                    col_info.update({"p01":pcts[0],"p25":pcts[1],"p50":pcts[2],
-                                     "p75":pcts[3],"p99":pcts[4]})
-            except Exception: pass
+    # ── cache a working sample for the per-column heavy work ──
+    if row_count > SAMPLE_FOR_STATS:
+        frac = min(1.0, SAMPLE_FOR_STATS / row_count)
+        df_stats = df.sample(fraction=frac, seed=42).cache()
+        sample_size = df_stats.count()
+        print(f"    (sampled {sample_size:,}/{row_count:,} rows for stats)")
+    else:
+        df_stats = df.cache()
+        df_stats.count()
 
-    # top values for strings
-    for col_info in columns:
-        if col_info["category"] == "string":
-            try:
-                top = (df.groupBy(col_info["name"]).count()
-                         .orderBy(F.desc("count")).limit(TOP_K_VALUES).collect())
-                col_info["top_values"] = [(r[col_info["name"]], r["count"]) for r in top]
-            except Exception: pass
-
-    # sample rows
-    sample_pd = df.limit(20).toPandas()
-
-    # ── structural detection ──
-    entities  = detect_entities(columns, row_count)
-    time_cols = detect_time_columns(df, columns)
-    groupings = detect_groupings(columns, row_count)
-
-    # granularity + completeness (if we found both entity and time)
-    grain = None
-    completeness = None
-    time_stats = None
-    if time_cols:
-        tc = time_cols[0]
-        tc_info = next(c for c in columns if c["name"] == tc["col"])
-        grain = detect_granularity(df, tc["col"], tc_info["category"])
-        if entities:
-            ec = entities[0]["col"]
-            completeness = analyze_completeness(spark_session, df, ec, tc["col"], label)
+    try:
+        # ── percentiles: ONE call for all numeric columns ──
         if numeric_names:
-            metric_subset = numeric_names[:8]  # cap to avoid huge queries
-            time_stats = time_summary_stats(
-                spark_session, df, tc["col"], metric_subset,
-                entity_col=entities[0]["col"] if entities else None)
+            try:
+                all_pcts = df_stats.stat.approxQuantile(
+                    numeric_names, [0.01, 0.25, 0.5, 0.75, 0.99], 0.01)
+                for name, pcts in zip(numeric_names, all_pcts):
+                    if pcts and len(pcts) == 5:
+                        ci = next(c for c in columns if c["name"] == name)
+                        ci.update({"p01": pcts[0], "p25": pcts[1], "p50": pcts[2],
+                                   "p75": pcts[3], "p99": pcts[4]})
+            except Exception:
+                pass
 
-    return {
-        "label": label, "source": src,
-        "row_count": row_count, "col_count": len(fields),
-        "columns": columns,
-        "sample_rows": sample_pd.head(20).to_dict(orient="records"),
-        "sample_display": sample_pd.head(10).to_string(index=False, max_cols=12),
-        "entities": entities,
-        "time_cols": time_cols,
-        "grain": grain,
-        "groupings": groupings,
-        "completeness": completeness,
-        "time_stats": time_stats,
-    }
+        # ── top values for strings: parallel queries from driver ──
+        if string_names:
+            def _top_values_for(name):
+                try:
+                    top = (df_stats.groupBy(name).count()
+                             .orderBy(F.desc("count")).limit(TOP_K_VALUES).collect())
+                    return name, [(r[name], r["count"]) for r in top]
+                except Exception:
+                    return name, []
+
+            workers = max(1, min(PROFILE_PARALLELISM, len(string_names)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for name, tv in pool.map(_top_values_for, string_names):
+                    if tv:
+                        ci = next(c for c in columns if c["name"] == name)
+                        ci["top_values"] = tv
+
+        # sample rows
+        sample_pd = df_stats.limit(20).toPandas()
+
+        # ── structural detection ──
+        entities  = detect_entities(columns, row_count)
+        time_cols = detect_time_columns(df_stats, columns)
+        groupings = detect_groupings(columns, row_count)
+
+        # granularity + completeness (if we found both entity and time)
+        grain = None
+        completeness = None
+        time_stats = None
+        if time_cols:
+            tc = time_cols[0]
+            tc_info = next(c for c in columns if c["name"] == tc["col"])
+            grain = detect_granularity(df, tc["col"], tc_info["category"])
+            if entities:
+                ec = entities[0]["col"]
+                completeness = analyze_completeness(spark_session, df, ec, tc["col"], label)
+            if numeric_names:
+                metric_subset = numeric_names[:8]  # cap to avoid huge queries
+                time_stats = time_summary_stats(
+                    spark_session, df, tc["col"], metric_subset,
+                    entity_col=entities[0]["col"] if entities else None)
+
+        return {
+            "label": label, "source": src,
+            "row_count": row_count, "col_count": len(fields),
+            "columns": columns,
+            "sample_rows": sample_pd.head(20).to_dict(orient="records"),
+            "sample_display": sample_pd.head(10).to_string(index=False, max_cols=12),
+            "entities": entities,
+            "time_cols": time_cols,
+            "grain": grain,
+            "groupings": groupings,
+            "completeness": completeness,
+            "time_stats": time_stats,
+        }
+    finally:
+        try:
+            df_stats.unpersist()
+        except Exception:
+            pass
 
 
 def format_profile_for_llm(p):
@@ -951,13 +1119,24 @@ def print_sanity_results(checks, summary):
 # COMMAND ----------
 
 def analyze(spark_session, tables, pdfs=None, user_prompt="",
-            sanity_checks=None):
+            sanity_checks=None, cache_dir=None, force_rebuild=None):
     """
     Main entry point.
 
     Returns dict with: profiles, col_map, completeness, benchmarks,
     code_cells, sanity_checks, notebook_path.
+
+    cache_dir / force_rebuild default to the module-level
+    CONTEXT_CACHE_DIR / FORCE_REBUILD_CONTEXT settings.  Profiles
+    and col-map entries are cached per (table_address, schema)
+    so repeat runs against the same table skip profiling and
+    LLM column inference entirely.
     """
+    if cache_dir is None:
+        cache_dir = CONTEXT_CACHE_DIR
+    if force_rebuild is None:
+        force_rebuild = FORCE_REBUILD_CONTEXT
+
     results = {
         "project_name": PROJECT_NAME,
         "profiles": {}, "col_map": {},
@@ -966,12 +1145,33 @@ def analyze(spark_session, tables, pdfs=None, user_prompt="",
         "notebook_path": None,
     }
 
-    # ── Phase 1: Profile ──
+    # ── Phase 1: Profile (with context cache) ──
     print("📊 Phase 1 — Profiling tables...")
+    new_labels = []      # labels that need col-map inference
+    table_schemas = {}   # label → (source, schema) for cache writes later
     for label, source in tables.items():
+        # cache lookup (only for string sources — DataFrames have no stable address)
+        cached = None
+        if isinstance(source, str) and not force_rebuild:
+            df_probe = spark_session.table(source)
+            df_probe.createOrReplaceTempView(label)  # restore view for downstream SQL
+            table_schemas[label] = (source, df_probe.schema)
+            cached = load_context(cache_dir, source, df_probe.schema)
+
+        if cached:
+            p = cached["profile"]
+            results["profiles"][label] = p
+            results["col_map"].update(cached.get("col_map_entries") or {})
+            results["completeness"][label] = p.get("completeness")
+            print(f"  ⚡ {label}  (cached: {p['row_count']:,} rows × {p['col_count']} cols)")
+            continue
+
         print(f"  🔄 {label}...", end=" ", flush=True)
         p = profile_table(spark_session, source, label)
         results["profiles"][label] = p
+        new_labels.append(label)
+        if isinstance(source, str) and label not in table_schemas:
+            table_schemas[label] = (source, spark_session.table(source).schema)
         print(f"✅ {p['row_count']:,} rows × {p['col_count']} cols")
         if p.get("entities"):
             print(f"    entity key: {p['entities'][0]['col']}")
@@ -1007,10 +1207,28 @@ def analyze(spark_session, tables, pdfs=None, user_prompt="",
         print(f"  ✅ {len(results['benchmarks'])} benchmarks, "
               f"{len(results['chart_references'])} chart refs")
 
-    # ── Phase 3: Column inference ──
-    print("\n🏷️  Phase 3 — Inferring column meanings...")
-    results["col_map"] = infer_columns(results["profiles"], all_chunks)
-    print(f"  ✅ {len(results['col_map'])} columns mapped")
+    # ── Phase 3: Column inference (new tables only) ──
+    if new_labels:
+        print(f"\n🏷️  Phase 3 — Inferring column meanings for {len(new_labels)} new table(s)...")
+        new_profiles = {l: results["profiles"][l] for l in new_labels}
+        new_col_map  = infer_columns(new_profiles, all_chunks)
+        results["col_map"].update(new_col_map)
+        print(f"  ✅ {len(new_col_map)} new columns mapped "
+              f"({len(results['col_map'])} total)")
+
+        # ── persist cache for newly profiled tables ──
+        for label in new_labels:
+            if label not in table_schemas:
+                continue
+            src, schema = table_schemas[label]
+            entries = {k: v for k, v in new_col_map.items()
+                       if k.startswith(f"{label}.")}
+            save_context(cache_dir, src, schema,
+                         results["profiles"][label], entries)
+    else:
+        print(f"\n🏷️  Phase 3 — All tables cached, skipping column inference "
+              f"({len(results['col_map'])} columns mapped from cache)")
+
     for key, info in list(results["col_map"].items())[:8]:
         print(f"    {key:<35s} → {info.get('meaning','?')[:50]}")
 

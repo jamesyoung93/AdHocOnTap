@@ -126,9 +126,9 @@ Click **Run All** or run cells 1 through 11 in order. The pipeline:
 
 | Phase | What happens |
 |-------|-------------|
-| **1. Profile** | PySpark-based profiling: schema, stats, entity key detection (NPI etc.), time grain detection, panel completeness, grouping columns, time-aware summary stats |
+| **1. Profile** | PySpark-based profiling: schema, stats, entity key detection (NPI etc.), time grain detection, panel completeness, grouping columns, time-aware summary stats. Results are cached per `(table_address, schema)` — repeat runs against the same table skip this phase entirely. |
 | **2. PDF Ingest** | Extracts text, chunks it, pulls out benchmark numbers and chart references |
-| **3. Column Inference** | LLM matches your column names to domain concepts using PDF context (e.g. `trx` → "Total Prescriptions") |
+| **3. Column Inference** | LLM matches your column names to domain concepts using PDF context (e.g. `trx` → "Total Prescriptions"). Also cached — only runs for tables that weren't a cache hit in Phase 1. |
 | **4. Code Generation** | Breaks your prompt into specific visualizations, generates self-contained Python cells for each |
 | **5. Sanity Checks** | Compares your data against PDF benchmarks and user-specified checks (PASS / WARNING / ALERT) |
 | **6. Save** | Writes all generated code to a `.py` notebook file you can import |
@@ -214,6 +214,50 @@ The smart profiler goes beyond basic stats. Here's what it finds:
 
 ---
 
+## Context Cache
+
+The analyzer caches each table's profile **and** its LLM-inferred column meanings to disk so repeat runs don't redo expensive work. The cache lives at `/dbfs/FileStore/ad_hoc_analyzer_cache/` and is keyed by `sha256(table_address + schema.json())` — if the table's schema changes, the cache auto-invalidates.
+
+On a cached run you'll see `⚡ table_name (cached: …)` instead of the usual profiling output, and Phase 3 (column inference) is skipped entirely for those tables.
+
+**Settings (Cell 1):**
+```python
+CONTEXT_CACHE_DIR     = "/dbfs/FileStore/ad_hoc_analyzer_cache"
+FORCE_REBUILD_CONTEXT = False   # set True to bypass the cache for one run
+```
+
+**Manual cache management:**
+```python
+list_context_cache()    # show what's cached
+clear_context_cache()   # wipe everything (call after rewriting a table in place)
+```
+
+If a table's data changes but its schema doesn't (e.g. an in-place overwrite), call `clear_context_cache()` or set `FORCE_REBUILD_CONTEXT=True` for that run.
+
+---
+
+## Profiling Speed on Wide Tables
+
+A few knobs in Cell 1 control how the profiler handles large/wide tables:
+
+```python
+MAX_PROFILE_COLS    = 60         # cap columns per table (first N are profiled)
+SAMPLE_FOR_STATS    = 500_000    # tables larger than this use a cached sample
+                                 # for percentiles + top-value queries
+PROFILE_PARALLELISM = 8          # driver threads for per-column top-value queries
+```
+
+Under the hood the profiler:
+- Runs **all** null/distinct/min/max/mean/stddev aggregates in **one** Spark pass over the full table (using `approx_count_distinct` instead of exact, which is dramatically faster on wide tables).
+- Batches every numeric column's percentiles into a **single** `approxQuantile` call.
+- Fans out per-column string top-value queries across `PROFILE_PARALLELISM` driver threads.
+- Caches a downsampled subset for the per-column heavy work when the table exceeds `SAMPLE_FOR_STATS` rows.
+- Projects the panel down to `distinct(entity, time)` once and caches it before computing completeness — reduces 5–6 passes over the raw table to a few passes over a tiny one.
+
+If profiling is still slow, the levers in order of impact are: lower `MAX_PROFILE_COLS`, lower `SAMPLE_FOR_STATS`, raise `PROFILE_PARALLELISM` (bounded by your driver cores).
+
+---
+
 ## LLM Endpoint Configuration
 
 Both notebooks default to `databricks-qwen3-next-80b-a3b-instruct`. To change:
@@ -264,5 +308,6 @@ Both files use the `# Databricks Notebook Source` / `# COMMAND ----------` forma
 | `Table not found` | Verify the Unity Catalog path: `spark.table("catalog.schema.table").limit(1).show()` |
 | `Permission denied on DBFS` | Ensure your cluster has access to `/dbfs/FileStore/`. Try: `dbutils.fs.ls("/FileStore/")` |
 | JSON parse error from LLM | The LLM sometimes returns markdown fences around JSON — the code strips these automatically. If it persists, try a different `LLM_ENDPOINT_NAME` |
-| Slow profiling | Set `MAX_PROFILE_COLS = 30` to limit columns. The profiler caps at 60 by default |
+| Slow profiling | See [Profiling Speed on Wide Tables](#profiling-speed-on-wide-tables). Lower `MAX_PROFILE_COLS` and `SAMPLE_FOR_STATS`, raise `PROFILE_PARALLELISM`. Repeat runs against the same table are nearly instant thanks to the [Context Cache](#context-cache). |
+| Stale cached profile | The cache invalidates automatically on schema changes, but if a table is rewritten in place with the same schema, run `clear_context_cache()` or set `FORCE_REBUILD_CONTEXT = True` |
 | Generated SQL fails | The interactive cell (Cell 12) lets you retry with different phrasing. Check that your table labels in `TABLE_INPUTS` match what you reference in the prompt |
