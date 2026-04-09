@@ -1,11 +1,14 @@
 # AdHocOnTap
 
-Two Databricks notebooks for AI-powered data analysis and report generation using LLM endpoints (Databricks Model Serving).
+AI-powered data analysis: profile any table, describe what you want in plain English, get reproducible analysis code and a slide-ready PowerPoint.
 
-| Notebook | What it does |
-|----------|-------------|
-| **`ad_hoc_analyzer.py`** | Point at tables + PDFs. Detects entity keys (NPI), time grain, panel completeness. You describe what you want in plain English — it generates deterministic, reproducible Python code cells you run to produce slide-ready figures. |
-| **`iterative_html_builder_v4.py`** | Builds rich, interactive HTML reports from PDF inputs using a 6-phase LLM pipeline (blueprint → scaffold → build → assemble → critique → repair). |
+| What | Where | Use when |
+|------|-------|----------|
+| **Local pandas demos** | [`demos/`](demos/) | You want to try it on your laptop or in Colab. No Databricks needed. Pluggable LLM (Anthropic / Gemini / Groq / OpenAI / Ollama). End-to-end CSVs → profile → reproducible code → PowerPoint deck → archive `.zip`. |
+| **`ad_hoc_analyzer.py`** | Repo root (Databricks notebook) | Production runs at scale on Delta tables. Spark-based, with column-level incremental caching. Point at tables + PDFs, get deterministic Python code cells. |
+| **`iterative_html_builder_v4.py`** | Repo root (Databricks notebook) | Builds rich, interactive HTML reports from PDF inputs via a 6-phase LLM pipeline. |
+
+**👉 New here? Start with the [local demos](demos/)** — two end-to-end examples (synthetic account activity + synthetic retail sales) that run in seconds and produce a finished PowerPoint deck plus an archive bundle.
 
 ---
 

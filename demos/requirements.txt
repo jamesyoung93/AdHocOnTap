@@ -1,0 +1,23 @@
+# Local AdHocOnTap demos — pip install -r demos/requirements.txt
+#
+# Profiling + analysis
+pandas>=2.0
+numpy>=1.24
+
+# Deck builder dependencies (the wheel is installed separately, see README)
+python-pptx>=0.6.23
+pyyaml>=6.0
+matplotlib>=3.7
+fontawesome
+pillow>=10.0
+
+# LLM providers — install only the one(s) you'll use.
+# Anthropic Claude (paid, top quality):
+anthropic>=0.40.0
+# Google Gemini (FREE tier ~1500 req/day):
+google-genai>=0.3.0
+# Groq (FREE tier, fast Llama):
+groq>=0.11.0
+# OpenAI:
+openai>=1.40.0
+# Ollama needs no Python SDK — just `ollama serve` running locally
